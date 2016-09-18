@@ -2,6 +2,7 @@ import io
 import re
 import sys
 import html5lib
+import functools
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ElementTree
 
@@ -9,11 +10,34 @@ from xml.etree.ElementTree import ElementTree
 NS = {'h': 'http://www.w3.org/1999/xhtml'}
 
 
-def is_void_element(element):
-    return any(element.tag == '{%s}%s' % (NS['h'], t)
-               for t in
-               '''area base br col command embed hr img input keygen link meta
-               param source track wbr'''.split())
+def element_tag_in_list(list, element):
+    p = '{%s}' % NS['h']
+    if element.tag.startswith(p):
+        return element.tag[len(p):] in list
+
+
+# No ending tag
+void_elements = (
+    '''area base br col command embed hr img input keygen link meta param
+    source track wbr'''.split())
+is_void_element = functools.partial(element_tag_in_list, void_elements)
+
+# Don't strip whitespace inside these
+pre_elements = 'xmp pre plaintext'.split()
+is_pre_element = functools.partial(element_tag_in_list, pre_elements)
+
+# Don't strip whitespace inside these, and don't escape &, <, >
+script_elements = 'script style'.split()
+is_script_element = functools.partial(element_tag_in_list, script_elements)
+
+# Strip whitespace after these start and end tags
+block_elements = (
+    '''address article aside blockquote blockquote body center dd details dir
+    div dl dt figcaption figure footer form frameset h1 h2 h3 h4 h5 h6 header
+    hgroup hr html listing main menu multicol nav ol p plaintext pre section
+    summary ul xmp'''.split())  # From Firefox html.css
+block_elements.append('head')  # Also strip after <head> and after </head>
+is_block_element = functools.partial(element_tag_in_list, block_elements)
 
 
 def serialize_html(write, elem, **kwargs):
@@ -46,7 +70,8 @@ def serialize_html(write, elem, **kwargs):
             if text or len(elem) or not is_void_element(elem):
                 write(">")
                 if text:
-                    write(text if tag in ('script', 'style') else ET._escape_cdata(text))
+                    write(text if tag in ('script', 'style')
+                          else ET._escape_cdata(text))
                 for e in elem:
                     serialize_html(write, e)
                 write("</" + tag + ">")
@@ -91,48 +116,55 @@ def tree_equal(t1, t2):
 
     return (log_eq(t1.tag, t2.tag, 'tag') and
             log_eq(t1.text or '', t2.text or '', 'text') and
-            log_eq(len(t1), len(t2), 'len') and
-            all(log_eq(c1.tail or '', c2.tail or '', t1.tag + ' tail') for c1, c2 in zip(t1, t2)) and
+            log_eq(len(t1), len(t2), t1.tag + ' len') and
+            all(log_eq(c1.tail or '', c2.tail or '', t1.tag + ' tail')
+                for c1, c2 in zip(t1, t2)) and
             all(tree_equal(c1, c2) for c1, c2 in zip(t1, t2)))
 
 
-def whitespace_model_pre(element):
-    if any(element.tag == '{%s}%s' % (NS['h'], t)
-           for t in 'xmp pre plaintext style script'.split()):
-        return True
+def default_ws_keep(element):
+    return is_pre_element(element) or is_script_element(element)
 
 
-def strip_insignificant_whitespace(element, keep=whitespace_model_pre,
-                                   space_before=False):
-    if keep(element):
-        return False
+def strip_insignificant_whitespace(element, keep=default_ws_keep):
 
-    main_element = any(element.tag == '{%s}%s' % (NS['h'], t)
-                       for t in 'html head body'.split())
+    def recurse(element, space_before):
+        if keep(element):
+            return False
 
-    def collapse(text, before):
-        if not text:
-            return '', before
-        start_space = text.lstrip() != text
-        if start_space and not before:
-            s = ' '
-        else:
-            s = ''
-        text = re.sub(r'(\S\s)\s+', r'\1', text)
-        return s + text.lstrip(), text.rstrip() != text
+        def collapse(text, before, block):
+            if block:
+                # Set space_before to True to eat whitespace after
+                return '', True
+            if not text:
+                return '', before
+            start_space = text.lstrip() != text
+            if start_space and not before:
+                s = ' '
+            else:
+                s = ''
+            text = re.sub(r'(\S\s)\s+', r'\1', text)
+            return s + text.lstrip(), text.rstrip() != text
 
-    element.text, space_before = collapse(element.text, space_before)
-    for child in element:
-        space_before = strip_insignificant_whitespace(
-            child, keep=keep, space_before=space_before)
-        child.tail, space_before = collapse(child.tail, space_before)
+        element.text, space_before = collapse(
+            element.text, space_before, is_block_element(element))
+        for child in element:
+            space_before = recurse(
+                child, space_before=space_before)
+            child.tail, space_before = collapse(
+                child.tail, space_before, is_block_element(child))
 
-    if main_element:
-        element.text = element.text.lstrip()
-        if len(element) > 0:
-            element[-1].tail = element[-1].tail.rstrip()
+        if is_block_element(element):
+            element.text = element.text.lstrip()
+            if len(element) > 0:
+                element[-1].tail = element[-1].tail.rstrip()
+            space_before = True
 
-    return space_before
+        return space_before
+
+    recurse(element, space_before=False)
+    if is_block_element(element) and element.tail:
+        element.tail = element.tail.lstrip()
 
 
 def main():
@@ -154,48 +186,77 @@ def main():
     print(tree_equal(document3, document3b))
     # print(input3)
 
+    def sound(x):
+        document = html5lib.parse(x)
+        return tree_equal(document3, document)
+
     pattern = (r'<(html|head|body|colgroup|tbody)>|' +
-               r'</(head|body|html|p|li|dt|dd|rt|rp|optgroup|option|menuitem|' +
-               r'colgroup|caption|thead|tbody|tfoot|tr|td|th)>')
-    a, b = '', input3
+               r'</(head|body|html|p|li|dt|dd|rt|rp|optgroup|option|' +
+               r'menuitem|colgroup|caption|thead|tbody|tfoot|tr|td|th)>')
 
-    def count(p, s):
-        return sum(1 for mo in re.finditer(p, s))
+    texts = []
+    matches = []
+    positions = []
+    i = 0
+    for mo in re.finditer(pattern, input3):
+        texts.append(input3[i:mo.start()])
+        matches.append(input3[mo.start():mo.end()])
+        positions.append(mo.start())
+        i = mo.end()
+    tail = input3[i:]
+    assert ''.join(a+b for a, b in zip(texts, matches)) + tail == input3
 
-    while True:
-        not_deleted = [a]
-        i = 0
-        match_start = []
-        match_end = []
-        for mo in re.finditer(pattern, b):
-            j = mo.start()
-            match_start.append(j)
-            not_deleted.append(b[i:j])
-            i = mo.end()
-            match_end.append(i)
-        if not match_start:
-            break
-        print(re.search(pattern, b).group(0))
-        not_deleted.append(b[i:])
-        skip = 0
-        while True:
-            print("Try skip %s/%s" % (skip, len(match_start)))
-            if skip >= len(match_start):
-                skip = len(match_start)
-                break
-            x = not_deleted[:-skip] if skip else not_deleted
-            input = ''.join(x) + (b[match_start[-skip]:] if skip else '')
-            print(input[:500])
-            document = html5lib.parse(input)
-            if tree_equal(document3b, document):
-                break
-            skip = 2*skip if skip else 1
-        if not skip:
-            break
-        a, b = ''.join(not_deleted[:-skip]) + b[match_start[-skip]:match_end[-skip]], b[match_end[-skip]:]
-        print("Remove %s tags: %s bytes" % (len(match_start) - skip, len(a)+len(b)))
-    input4 = a + b
-    # print(input4)
+    decision = []
+
+    def pick_one(m):
+        # print("Pick one among %s" % ' '.join(m))
+        if m and m[0] == '<tbody>':
+            return 1
+
+        try:
+            return next(i+1 for i in range(len(m)-1)
+                        if m[i] == '</thead>' and m[i+1] == '<tbody>')
+        except StopIteration:
+            pass
+
+        return (1+len(m)) // 2
+
+    while len(decision) < len(matches):
+        lo = len(decision)
+        hi = len(matches) + 1
+        # Monotone predicate: Given i in [len(decision), len(matches)],
+        # is it ok to exclude the first i?
+        # Binary search problem:
+        # Find the first i in [lo, len(matches)+1)
+        # where the predicate is false.
+        prefix = ''.join(a + (b if c else '')
+                         for a, b, c in zip(texts, matches, decision))
+        while lo + 1 < hi:
+            mid = lo + pick_one(matches[lo:hi-1])
+            # Is excluding decision + [lo, mid) ok?
+            print("[%s, %s): Try %s %s" % (lo, hi, mid, ' '.join(matches[len(decision):mid])))
+            # Try forming a text where all in [len(decision), mid) are excluded
+            x = ''.join(texts[len(decision):mid])
+            y = ''.join(a + b for a, b in zip(texts[mid:], matches[mid:]))
+            z = prefix + x + y + tail
+            if sound(z):
+                lo = mid
+            else:
+                hi = mid
+        # All up to lo-1 can be safely excluded
+        assert len(decision) < lo or lo < len(matches)
+        if len(decision) < lo:
+            print("Exclude [%s, %s)" % (len(decision), lo))
+            decision.extend(False for _ in range(len(decision), lo))
+        if lo < len(matches):
+            print("Include %s: %s in position %s" % (lo, matches[lo], positions[lo]))
+            decision.append(True)
+
+    result = ''.join(a + (b if c else '')
+                     for a, b, c in zip(texts, matches, decision)) + tail
+    with open("output.html", "w") as fp:
+        fp.write(result)
+    print("output.html: %s bytes" % len(result))
 
 
 if __name__ == "__main__":
