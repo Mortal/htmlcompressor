@@ -108,7 +108,7 @@ def element_to_html(element):
         return "<!DOCTYPE html>" + buf.getvalue()
 
 
-def tree_equal(t1, t2, do_log=True):
+def tree_equal(t1, t2, do_log=False):
     def log(b, s):
         if not b:
             print(s)
