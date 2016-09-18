@@ -12,6 +12,8 @@ NS = {'h': 'http://www.w3.org/1999/xhtml'}
 
 
 def element_tag_in_list(list, element):
+    if element.tag is ET.Comment or element.tag is ET.ProcessingInstruction:
+        return False
     p = '{%s}' % NS['h']
     if element.tag.startswith(p):
         return element.tag[len(p):] in list
@@ -28,7 +30,7 @@ pre_elements = 'xmp pre plaintext'.split()
 is_pre_element = functools.partial(element_tag_in_list, pre_elements)
 
 # Don't strip whitespace inside these, and don't escape &, <, >
-script_elements = 'script style'.split()
+script_elements = 'noscript script style'.split()
 is_script_element = functools.partial(element_tag_in_list, script_elements)
 
 # Strip whitespace after these start and end tags
@@ -38,6 +40,8 @@ block_elements = (
     hgroup hr html listing main menu multicol nav ol p plaintext pre section
     summary ul xmp'''.split())  # From Firefox html.css
 block_elements.append('head')  # Also strip after <head> and after </head>
+block_elements.extend('table tbody thead tfoot tr td colgroup col'.split())
+block_elements.extend('option optgroup'.split())
 is_block_element = functools.partial(element_tag_in_list, block_elements)
 
 
@@ -73,7 +77,7 @@ def serialize_html(write, elem, **kwargs):
             if text or len(elem) or not is_void_element(elem):
                 write(">")
                 if text:
-                    write(text if tag in ('script', 'style')
+                    write(text if is_script_element(elem)
                           else ET._escape_cdata(text))
                 for e in elem:
                     serialize_html(write, e)
@@ -123,11 +127,11 @@ def tree_equal(t1, t2, do_log=False):
 
     return (log_eq(t1.tag, t2.tag, 'tag') and
             log_eq(t1.text or '', t2.text or '', 'text') and
-            log_eq(len(t1), len(t2), t1.tag + ' len') and
-            log_eq(sorted(t1.keys()), sorted(t2.keys()), t1.tag + ' keys') and
-            all(log_eq(t1.get(k), t2.get(k), t1.tag + ' value of ' + k)
+            log_eq(len(t1), len(t2), '%s len' % (t1.tag,)) and
+            log_eq(sorted(t1.keys()), sorted(t2.keys()), '%s keys' % (t1.tag,)) and
+            all(log_eq(t1.get(k), t2.get(k), '%s value of %s' % (t1.tag, k))
                 for k in t1.keys()) and
-            all(log_eq(c1.tail or '', c2.tail or '', t1.tag + ' tail')
+            all(log_eq(c1.tail or '', c2.tail or '', '%s tail' % (t1.tag,))
                 for c1, c2 in zip(t1, t2)) and
             all(tree_equal(c1, c2) for c1, c2 in zip(t1, t2)))
 
@@ -136,9 +140,18 @@ def default_ws_keep(element):
     return is_pre_element(element) or is_script_element(element)
 
 
-def strip_insignificant_whitespace(element, keep=default_ws_keep):
+def strip_script_whitespace(text):
+    lines = [line.strip() for line in text.splitlines()]
+    return '\n'.join(line for line in lines if line)
 
+
+def strip_insignificant_whitespace(element, keep=default_ws_keep):
     def recurse(element, space_before):
+        if is_script_element(element):
+            if element.text:
+                element.text = strip_script_whitespace(element.text)
+            return False
+
         if keep(element):
             return False
 
@@ -151,7 +164,8 @@ def strip_insignificant_whitespace(element, keep=default_ws_keep):
             else:
                 s = ''
             text = re.sub(r'(\S\s)\s+', r'\1', text)
-            return s + text.lstrip(), text.rstrip() != text
+            text = text.lstrip()
+            return s + text, text.rstrip() != text
 
         element.text, space_before = collapse(
             element.text, space_before or is_block_element(element))
@@ -258,9 +272,9 @@ def main():
             lo = hi - 1
         # Otherwise, actually do the binary search.
         while lo + 1 < hi:
-            mid = lo + pick_one(matches[lo:hi-1])
+            mid = lo + (hi - lo) // 2
             # Is excluding decision + [lo, mid) ok?
-            print("[%s, %s): Try %s %s" % (lo, hi, mid, ' '.join(matches[len(decision):mid])))
+            # print("[%s, %s): Try %s %s" % (lo, hi, mid, ' '.join(matches[len(decision):mid])))
             if test(mid):
                 lo = mid
                 break
@@ -269,7 +283,7 @@ def main():
         # All up to lo can be safely excluded
         assert len(decision) < lo or lo < len(matches)
         if len(decision) < lo:
-            print("Exclude [%s, %s)" % (len(decision), lo))
+            print("Exclude [%s, %s) out of %s" % (len(decision), lo, len(matches)))
             decision.extend(False for _ in range(len(decision), lo))
         if lo < len(matches) and lo + 1 == hi:
             print("Include %s: %s in position %s" % (lo, matches[lo], positions[lo]))
@@ -279,7 +293,8 @@ def main():
                      for a, b, c in zip(texts, matches, decision)) + tail
     with open("output.html", "w") as fp:
         fp.write(result)
-    print("output.html: %s bytes" % len(result))
+    print("output.html: %s bytes (%.1f%%)" %
+          (len(result), 100 * len(result) / len(input)))
     t2 = time.time()
     print("Took %.2f seconds" % (t2 - t1))
 
