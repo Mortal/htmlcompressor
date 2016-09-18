@@ -1,6 +1,7 @@
 import io
 import re
 import sys
+import time
 import html5lib
 import functools
 import xml.etree.ElementTree as ET
@@ -66,7 +67,9 @@ def serialize_html(write, elem, **kwargs):
                         v = v.text
                     else:
                         v = ET._escape_attrib(v)
-                    write(" %s=\"%s\"" % (k, v))
+                    if not v or any(c in v for c in ' ='):
+                        v = '"%s"' % v
+                    write(" %s=%s" % (k, v))
             if text or len(elem) or not is_void_element(elem):
                 write(">")
                 if text:
@@ -105,18 +108,25 @@ def element_to_html(element):
         return "<!DOCTYPE html>" + buf.getvalue()
 
 
-def tree_equal(t1, t2):
+def tree_equal(t1, t2, do_log=True):
     def log(b, s):
         if not b:
             print(s)
         return b
 
-    def log_eq(a, b, s):
-        return log(a == b, (s, a, b))
+    if do_log:
+        def log_eq(a, b, s):
+            return log(a == b, (s, a, b))
+    else:
+        def log_eq(a, b, _):
+            return a == b
 
     return (log_eq(t1.tag, t2.tag, 'tag') and
             log_eq(t1.text or '', t2.text or '', 'text') and
             log_eq(len(t1), len(t2), t1.tag + ' len') and
+            log_eq(sorted(t1.keys()), sorted(t2.keys()), t1.tag + ' keys') and
+            all(log_eq(t1.get(k), t2.get(k), t1.tag + ' value of ' + k)
+                for k in t1.keys()) and
             all(log_eq(c1.tail or '', c2.tail or '', t1.tag + ' tail')
                 for c1, c2 in zip(t1, t2)) and
             all(tree_equal(c1, c2) for c1, c2 in zip(t1, t2)))
@@ -132,10 +142,7 @@ def strip_insignificant_whitespace(element, keep=default_ws_keep):
         if keep(element):
             return False
 
-        def collapse(text, before, block):
-            if block:
-                # Set space_before to True to eat whitespace after
-                return '', True
+        def collapse(text, before):
             if not text:
                 return '', before
             start_space = text.lstrip() != text
@@ -147,12 +154,12 @@ def strip_insignificant_whitespace(element, keep=default_ws_keep):
             return s + text.lstrip(), text.rstrip() != text
 
         element.text, space_before = collapse(
-            element.text, space_before, is_block_element(element))
+            element.text, space_before or is_block_element(element))
         for child in element:
             space_before = recurse(
                 child, space_before=space_before)
             child.tail, space_before = collapse(
-                child.tail, space_before, is_block_element(child))
+                child.tail, space_before or is_block_element(child))
 
         if is_block_element(element):
             element.text = element.text.lstrip()
@@ -168,23 +175,23 @@ def strip_insignificant_whitespace(element, keep=default_ws_keep):
 
 
 def main():
+    t1 = time.time()
     input = sys.stdin.read()
     print("Input size: %s bytes" % len(input))
-    # print(input)
     document = html5lib.parse(input)
     input2 = element_to_html(document)
     document2 = html5lib.parse(input2)
     print("Roundtrip element_to_html: %s bytes" % len(input2))
-    print(tree_equal(document, document2))
-    # print(input2)
+    assert tree_equal(document, document2)
     document3 = html5lib.parse(input2)
     strip_insignificant_whitespace(document3)
     input3 = element_to_html(document3)
     print("Strip insignificant whitespace: %s bytes" % len(input3))
-    print(tree_equal(document2, document3))
+    if not tree_equal(document2, document3):
+        print("Stripping insignificant whitespace changes parsing, " +
+              "but we ignore that")
     document3b = html5lib.parse(input3)
-    print(tree_equal(document3, document3b))
-    # print(input3)
+    assert tree_equal(document3, document3b)
 
     def sound(x):
         document = html5lib.parse(x)
@@ -219,36 +226,52 @@ def main():
         except StopIteration:
             pass
 
-        return (1+len(m)) // 2
-
     while len(decision) < len(matches):
         lo = len(decision)
         hi = len(matches) + 1
+
         # Monotone predicate: Given i in [len(decision), len(matches)],
         # is it ok to exclude the first i?
+
+        def test(mid):
+            # Try forming a text where all in [len(decision), mid) are excluded
+            x = ''.join(texts[len(decision):mid])
+            y = ''.join(a + b for a, b in zip(texts[mid:], matches[mid:]))
+            z = prefix + x + y + tail
+            return sound(z)
+
         # Binary search problem:
         # Find the first i in [lo, len(matches)+1)
         # where the predicate is false.
         prefix = ''.join(a + (b if c else '')
                          for a, b, c in zip(texts, matches, decision))
+
+        # Can pick_one help us find the bad tag?
+        guide = pick_one(matches[lo:hi-1])
+        if guide is not None:
+            if test(lo + guide):
+                lo = lo + guide
+                if lo + 1 < hi and not test(lo + 1):
+                    hi = lo + 1
+        # Otherwise, can we exclude everything?
+        elif test(hi - 1):
+            lo = hi - 1
+        # Otherwise, actually do the binary search.
         while lo + 1 < hi:
             mid = lo + pick_one(matches[lo:hi-1])
             # Is excluding decision + [lo, mid) ok?
             print("[%s, %s): Try %s %s" % (lo, hi, mid, ' '.join(matches[len(decision):mid])))
-            # Try forming a text where all in [len(decision), mid) are excluded
-            x = ''.join(texts[len(decision):mid])
-            y = ''.join(a + b for a, b in zip(texts[mid:], matches[mid:]))
-            z = prefix + x + y + tail
-            if sound(z):
+            if test(mid):
                 lo = mid
+                break
             else:
                 hi = mid
-        # All up to lo-1 can be safely excluded
+        # All up to lo can be safely excluded
         assert len(decision) < lo or lo < len(matches)
         if len(decision) < lo:
             print("Exclude [%s, %s)" % (len(decision), lo))
             decision.extend(False for _ in range(len(decision), lo))
-        if lo < len(matches):
+        if lo < len(matches) and lo + 1 == hi:
             print("Include %s: %s in position %s" % (lo, matches[lo], positions[lo]))
             decision.append(True)
 
@@ -257,6 +280,8 @@ def main():
     with open("output.html", "w") as fp:
         fp.write(result)
     print("output.html: %s bytes" % len(result))
+    t2 = time.time()
+    print("Took %.2f seconds" % (t2 - t1))
 
 
 if __name__ == "__main__":
