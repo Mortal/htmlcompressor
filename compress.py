@@ -41,6 +41,7 @@ block_elements = (
     summary ul xmp'''.split())  # From Firefox html.css
 block_elements.append('head')  # Also strip after <head> and after </head>
 block_elements.extend('table tbody thead tfoot tr td colgroup col'.split())
+block_elements.extend('li'.split())
 block_elements.extend('option optgroup'.split())
 is_block_element = functools.partial(element_tag_in_list, block_elements)
 
